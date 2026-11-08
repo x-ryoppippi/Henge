@@ -1,0 +1,105 @@
+name: Nix
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Builds on main publish releases, so they queue instead of cancelling one another.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ipa:
+    runs-on: blacksmith-12vcpu-macos-27
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Show Xcode
+        id: xcode
+        run: |
+          xcode-select -p
+          xcodebuild -version
+          build="$(xcodebuild -version | sed -n 's/^Build version //p')"
+          test -n "$build" || { echo "could not read the Xcode build version" >&2; exit 1; }
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+        with:
+          # The derivations compile with the runner's Xcode (see nix/xcode.nix).
+          extra_nix_config: |
+            sandbox = relaxed
+
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+        with:
+          # The derivations use the runner's Xcode without Nix seeing it, so its build is in the key.
+          primary-key: nix-${{ runner.os }}-xcode-${{ steps.xcode.outputs.build }}-${{ hashFiles('**/*.nix', 'flake.lock', 'ci/stikjit-high-address.patch', '.github/workflows/nix.yml') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-xcode-${{ steps.xcode.outputs.build }}-
+          gc-max-store-size-macos: 6G
+
+      - name: Build dependencies
+        # Out-links make them GC roots: Henge.ipa copies them in without referencing them, so
+        # cache-nix-action's garbage collection would otherwise drop them before saving.
+        run: nix build -L -o result-deps .#iosLibs .#rppairing .#stikjitFramework
+
+      - name: Build Henge.ipa and Henge.tipa
+        run: |
+          nix build -L -o result-ipa .#ipa
+          nix build -L -o result-tipa .#tipa
+          mkdir dist
+          cp result-ipa/Henge.ipa result-tipa/Henge.tipa dist/
+          (cd dist && shasum -a 256 Henge.ipa Henge.tipa > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Henge-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          overwrite: true
+
+  # A separate job so the write token never sits beside the build's code.
+  release:
+    needs: ipa
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: Henge-${{ github.sha }}
+          path: dist
+
+      - name: Publish a release for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        # One immutable release per commit, so releases/latest/download/Henge.ipa is a stable URL.
+        # gh uploads the assets to a draft and publishes it only once they are all there, so a failed
+        # run never replaces the previous build. The tag comes from the commit, so re-runs find it.
+        run: |
+          day="$(gh api "repos/$GH_REPO/commits/$GITHUB_SHA" -q '.commit.committer.date[0:10]' | tr -d -)"
+          tag="nightly-$day-${GITHUB_SHA::7}"
+          if [ "$(gh release view "$tag" --json isDraft -q .isDraft 2> /dev/null)" = false ]; then
+            echo "$tag is already published"
+            exit 0
+          fi
+          # What a failed earlier attempt left behind.
+          if gh release view "$tag" > /dev/null 2>&1; then gh release delete "$tag" --yes; fi
+          # A re-run of an older commit must not take latest from a newer build.
+          # Assigned on its own line so a failed lookup fails the step instead of reading as "not the tip".
+          tip="$(gh api "repos/$GH_REPO/commits/main" -q .sha)"
+          latest=false
+          [ "$tip" = "$GITHUB_SHA" ] && latest=true
+          gh release create "$tag" dist/Henge.ipa dist/Henge.tipa dist/SHA256SUMS \
+            --target "$GITHUB_SHA" --latest="$latest" --title "Nightly ${day:0:4}-${day:4:2}-${day:6:2} (${GITHUB_SHA::7})" \
+            --notes "Built by Nix from $GITHUB_SHA on Blacksmith macOS (see the run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID). Ad hoc signed: install with SideStore or AltStore, or Henge.tipa with TrollStore."
