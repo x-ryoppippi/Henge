@@ -38,7 +38,6 @@ jobs:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', 'flake.lock', 'ci/stikjit-high-address.patch') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-macos: 6G
-          save: ${{ github.event_name != 'pull_request' }}
 
       - name: Build dependencies
         run: nix build -L --no-link .#iosLibs .#rppairing .#stikjitFramework
