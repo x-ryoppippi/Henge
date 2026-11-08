@@ -16,6 +16,7 @@ import UIKit
 ///   move X Y, click X Y  the pointer to a spot on the Mac's screen (its pixels), and a click there
 ///   pointer            where the pointer is now, into the log
 ///   knob NAME VALUE    a translation knob (core/machine.h)
+///   cpus N             the CPUs setting (1-6) for the next Mac started; it stays, so set it back afterwards
 ///   balloon MB         ask the Mac for that much of its memory back (HV_BALLOON set), log what it gave
 ///   snap [NAME]        the Mac's screen (1920x1080) into Documents/NAME.jpg (snap.jpg)
 ///   log TEXT           a marker in henge.log
@@ -117,6 +118,13 @@ enum Autopilot {
                 HengeLog.log("autopilot", "snap \(url.lastPathComponent), \(data.count / 1024) KB")
             } else {
                 HengeLog.log("autopilot", "snap: no screen to read")
+            }
+        case "cpus": // "cpus 2": the CPU count the next Mac started gets (the CPUs setting, kept: put it back after a test)
+            if let n = Int(arg), (1...6).contains(n) {
+                UserDefaults.standard.set(n, forKey: "henge.cpus")
+                HengeLog.log("autopilot", "cpus \(n) for the next start")
+            } else {
+                HengeLog.log("autopilot", "cpus wants 1 to 6")
             }
         case "balloon": // "balloon 2048": ask the Mac to hand 2 GB of its memory back (needs HV_BALLOON in henge-env.txt)
             let got = henge_vm_balloon(Int(arg) ?? -1)

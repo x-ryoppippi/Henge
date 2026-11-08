@@ -32,9 +32,23 @@ static void reg(void) {
     if (i < MAX_THREADS) threads[i] = mach_thread_self();
 }
 
+/* Functions in other images (the system's libraries), by the address dladdr names: where the rest goes */
+#define OTHER_SLOTS 256
+static struct { uintptr_t fn; const char *name; uint32_t n; } other[OTHER_SLOTS];
+
+static void count_other(const Dl_info *info) {
+    uintptr_t fn = (uintptr_t)info->dli_saddr;
+    uint32_t h = (uint32_t)((fn >> 2) * 2654435761u) % OTHER_SLOTS;
+    for (int k = 0; k < 16; k++, h = (h + 1) % OTHER_SLOTS) {
+        if (other[h].fn == fn) { other[h].n++; return; }
+        if (!other[h].n) { other[h].fn = fn, other[h].name = info->dli_sname, other[h].n = 1; return; }
+    }
+}
+
 static void count_host(uintptr_t pc) {
     Dl_info info;
-    if (!dladdr((void *)pc, &info) || (uintptr_t)info.dli_fbase != image_base) { other_image++; return; }
+    if (!dladdr((void *)pc, &info)) { other_image++; return; }
+    if ((uintptr_t)info.dli_fbase != image_base) { other_image++; count_other(&info); return; }
     uintptr_t off = pc - image_base;
     uint32_t h = (uint32_t)((off >> 2) * 2654435761u) % SLOTS;
     for (int k = 0; k < 64; k++, h = (h + 1) % SLOTS) {
@@ -49,6 +63,11 @@ static int by_count(const void *a, const void *b) {
     return (int)y->n - (int)x->n;
 }
 
+static int by_count_other(const void *a, const void *b) {
+    const __typeof__(other[0]) *x = a, *y = b;
+    return (int)y->n - (int)x->n;
+}
+
 static void dump(void) {
     static __typeof__(slots[0]) sorted[SLOTS];
     memcpy(sorted, slots, sizeof slots);
@@ -59,6 +78,12 @@ static void dump(void) {
             busy ? 100.0 * other_image / busy : 0, (unsigned long)image_base);
     for (int i = 0; i < 40 && sorted[i].n; i++)
         fprintf(stderr, "hvprof: %5.2f%% +%#lx\n", busy ? 100.0 * sorted[i].n / busy : 0, (unsigned long)sorted[i].off);
+    static __typeof__(other[0]) osorted[OTHER_SLOTS];
+    memcpy(osorted, other, sizeof other);
+    qsort(osorted, OTHER_SLOTS, sizeof osorted[0], by_count_other);
+    for (int i = 0; i < 12 && osorted[i].n; i++)
+        fprintf(stderr, "hvprof: %5.2f%% %s (other image)\n", busy ? 100.0 * osorted[i].n / busy : 0, osorted[i].name ? osorted[i].name : "?");
+    memset(other, 0, sizeof other);
     memset(slots, 0, sizeof slots);
     total = idle = jit = other_image = unknown = 0;
 }

@@ -25,6 +25,9 @@ static void knobs_init(void) {
     for (int i = 0; i < HV_K_COUNT; i++)
         hv_knob[i] = getenv(hv_knob_names[i]) ? atoi(getenv(hv_knob_names[i])) : 0;
     if (getenv("HV_NO_RAS") && !*getenv("HV_NO_RAS")) hv_knob[HV_K_NO_RAS] = 1;
+    /* On unless asked: Golden Gate on the phone (2026-11-08) ran 200 process spawns ~3% faster with it, and none
+       of the checked skips (1 in 32 are checked, see sysreg.c) found an out-of-date entry. */
+    if (!getenv("HV_SWITCH_FLUSH")) hv_knob[HV_K_SWITCHFLUSH] = 2;
 }
 
 int hv_knob_set(HvMachine *m, const char *name, int value) {
