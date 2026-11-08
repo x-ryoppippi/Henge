@@ -64,7 +64,7 @@ jobs:
           overwrite: true
 
   # A separate job so the write token never sits beside the build's code.
-  nightly:
+  release:
     needs: ipa
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: blacksmith-2vcpu-ubuntu-2404
@@ -76,19 +76,15 @@ jobs:
           name: Henge-${{ github.sha }}
           path: dist
 
-      - name: Publish the nightly release
+      - name: Publish a release for this commit
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+        # One immutable release per build, marked latest, so releases/latest/download/Henge.ipa is a
+        # stable URL. gh uploads the assets to a draft and publishes it only once they are all there,
+        # so a failed run never replaces the previous build.
         run: |
-          title="Nightly (${GITHUB_SHA::7})"
-          notes="Built by Nix from $GITHUB_SHA on Blacksmith macOS (see the run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID). Ad hoc signed: install with SideStore or AltStore, or Henge.tipa with TrollStore."
-          # Updated in place, never deleted first, so a failed publish leaves the last nightly downloadable.
-          if gh release view nightly > /dev/null 2>&1; then
-            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/nightly" -f sha="$GITHUB_SHA" -F force=true > /dev/null
-            gh release upload nightly dist/Henge.ipa dist/Henge.tipa dist/SHA256SUMS --clobber
-            gh release edit nightly --title "$title" --notes "$notes"
-          else
-            gh release create nightly dist/Henge.ipa dist/Henge.tipa dist/SHA256SUMS \
-              --target "$GITHUB_SHA" --prerelease --title "$title" --notes "$notes"
-          fi
+          tag="nightly-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+          gh release create "$tag" dist/Henge.ipa dist/Henge.tipa dist/SHA256SUMS \
+            --target "$GITHUB_SHA" --latest --title "Nightly $(date -u +%Y-%m-%d) (${GITHUB_SHA::7})" \
+            --notes "Built by Nix from $GITHUB_SHA on Blacksmith macOS (see the run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID). Ad hoc signed: install with SideStore or AltStore, or Henge.tipa with TrollStore."
