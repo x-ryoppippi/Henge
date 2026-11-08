@@ -32,6 +32,7 @@
 
       devShells.default = pkgs.mkShellNoCC {
         packages = [
+          pkgs.just
           scope.rust
           scope.python
           pkgs.xcodegen
