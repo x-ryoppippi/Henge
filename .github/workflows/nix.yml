@@ -45,12 +45,41 @@ jobs:
       - name: Build dependencies
         run: nix build -L --no-link .#iosLibs .#rppairing .#stikjitFramework
 
-      - name: Build Henge.ipa
-        run: nix build -L -o result-ipa .#ipa
+      - name: Build Henge.ipa and Henge.tipa
+        run: |
+          nix build -L -o result-ipa .#ipa
+          nix build -L -o result-tipa .#tipa
+          mkdir dist
+          cp result-ipa/Henge.ipa result-tipa/Henge.tipa dist/
+          (cd dist && shasum -a 256 Henge.ipa Henge.tipa > SHA256SUMS)
+          cat dist/SHA256SUMS
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: Henge-${{ github.sha }}
-          path: result-ipa/Henge.ipa
+          path: dist/
           if-no-files-found: error
           overwrite: true
+
+  # A separate job so the write token never sits beside the build's code.
+  nightly:
+    needs: ipa
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: Henge-${{ github.sha }}
+          path: dist
+
+      - name: Replace the nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view nightly > /dev/null 2>&1; then gh release delete nightly --cleanup-tag --yes; fi
+          gh release create nightly dist/Henge.ipa dist/Henge.tipa dist/SHA256SUMS \
+            --target "$GITHUB_SHA" --prerelease --title "Nightly (${GITHUB_SHA::7})" \
+            --notes "Built by Nix from $GITHUB_SHA on Blacksmith macOS (see the run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID). Ad hoc signed: install with SideStore or AltStore, or Henge.tipa with TrollStore."
