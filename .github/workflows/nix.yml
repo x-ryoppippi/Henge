@@ -41,12 +41,14 @@ jobs:
       - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
         with:
           # The derivations use the runner's Xcode without Nix seeing it, so its build is in the key.
-          primary-key: nix-${{ runner.os }}-xcode-${{ steps.xcode.outputs.build }}-${{ hashFiles('**/*.nix', 'flake.lock', 'ci/stikjit-high-address.patch') }}
+          primary-key: nix-${{ runner.os }}-xcode-${{ steps.xcode.outputs.build }}-${{ hashFiles('**/*.nix', 'flake.lock', 'ci/stikjit-high-address.patch', '.github/workflows/nix.yml') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-xcode-${{ steps.xcode.outputs.build }}-
           gc-max-store-size-macos: 6G
 
       - name: Build dependencies
-        run: nix build -L --no-link .#iosLibs .#rppairing .#stikjitFramework
+        # Out-links make them GC roots: Henge.ipa copies them in without referencing them, so
+        # cache-nix-action's garbage collection would otherwise drop them before saving.
+        run: nix build -L -o result-deps .#iosLibs .#rppairing .#stikjitFramework
 
       - name: Build Henge.ipa and Henge.tipa
         run: |
