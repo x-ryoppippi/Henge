@@ -73,7 +73,14 @@ struct RootView: View {
             jit.enableAtLaunchIfAsked()
         }
         .onChange(of: jit.attachGeneration) { _ in JITBootstrap.prewarm() } // the built-in helper attached
-        .task { await Autopilot.run { mac in running = mac } } // testing only: HENGE_AUTOPILOT
+        .task { // testing only: HENGE_AUTOPILOT
+            await Autopilot.run { mac in
+                // A session still on screen (its Mac stopped) is closed first: the same value again would start nothing.
+                guard running != nil else { running = mac; return }
+                running = nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { running = mac }
+            }
+        }
     }
 }
 
