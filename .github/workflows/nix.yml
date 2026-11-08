@@ -80,13 +80,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        # One immutable release per build, marked latest, so releases/latest/download/Henge.ipa is a
-        # stable URL. gh uploads the assets to a draft and publishes it only once they are all there,
-        # so a failed run never replaces the previous build.
+        # One immutable release per commit, so releases/latest/download/Henge.ipa is a stable URL.
+        # gh uploads the assets to a draft and publishes it only once they are all there, so a failed
+        # run never replaces the previous build. The tag comes from the commit, so re-runs find it.
         run: |
-          tag="nightly-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
-          # A re-run must not collide with the first attempt's release or leftover draft.
-          [ "$GITHUB_RUN_ATTEMPT" = 1 ] || tag="$tag.$GITHUB_RUN_ATTEMPT"
+          day="$(gh api "repos/$GH_REPO/commits/$GITHUB_SHA" -q '.commit.committer.date[0:10]' | tr -d -)"
+          tag="nightly-$day-${GITHUB_SHA::7}"
+          if [ "$(gh release view "$tag" --json isDraft -q .isDraft 2> /dev/null)" = false ]; then
+            echo "$tag is already published"
+            exit 0
+          fi
+          # What a failed earlier attempt left behind.
+          if gh release view "$tag" > /dev/null 2>&1; then gh release delete "$tag" --yes; fi
+          # A re-run of an older commit must not take latest from a newer build.
+          latest=false
+          [ "$(gh api "repos/$GH_REPO/commits/main" -q .sha)" = "$GITHUB_SHA" ] && latest=true
           gh release create "$tag" dist/Henge.ipa dist/Henge.tipa dist/SHA256SUMS \
-            --target "$GITHUB_SHA" --latest --title "Nightly $(date -u +%Y-%m-%d) (${GITHUB_SHA::7})" \
+            --target "$GITHUB_SHA" --latest="$latest" --title "Nightly ${day:0:4}-${day:4:2}-${day:6:2} (${GITHUB_SHA::7})" \
             --notes "Built by Nix from $GITHUB_SHA on Blacksmith macOS (see the run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID). Ad hoc signed: install with SideStore or AltStore, or Henge.tipa with TrollStore."
