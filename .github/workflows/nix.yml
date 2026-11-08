@@ -11,7 +11,8 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Builds on main publish releases, so they queue instead of cancelling one another.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   ipa:
