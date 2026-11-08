@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: read
-  actions: write # cache-nix-action purges the caches it replaces
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -39,11 +38,6 @@ jobs:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', 'flake.lock', 'ci/stikjit-high-address.patch') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-macos: 6G
-          purge: true
-          purge-prefixes: nix-${{ runner.os }}-
-          purge-created: 0
-          purge-last-accessed: P7D
-          purge-primary-key: never
           save: ${{ github.event_name != 'pull_request' }}
 
       - name: Build dependencies
@@ -57,3 +51,4 @@ jobs:
           name: Henge-${{ github.sha }}
           path: result-ipa/Henge.ipa
           if-no-files-found: error
+          overwrite: true
