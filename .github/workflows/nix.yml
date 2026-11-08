@@ -27,7 +27,9 @@ jobs:
         run: |
           xcode-select -p
           xcodebuild -version
-          echo "build=$(xcodebuild -version | sed -n 's/^Build version //p')" >> "$GITHUB_OUTPUT"
+          build="$(xcodebuild -version | sed -n 's/^Build version //p')"
+          test -n "$build" || { echo "could not read the Xcode build version" >&2; exit 1; }
+          echo "build=$build" >> "$GITHUB_OUTPUT"
 
       - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
         with:
@@ -74,12 +76,19 @@ jobs:
           name: Henge-${{ github.sha }}
           path: dist
 
-      - name: Replace the nightly release
+      - name: Publish the nightly release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          if gh release view nightly > /dev/null 2>&1; then gh release delete nightly --cleanup-tag --yes; fi
-          gh release create nightly dist/Henge.ipa dist/Henge.tipa dist/SHA256SUMS \
-            --target "$GITHUB_SHA" --prerelease --title "Nightly (${GITHUB_SHA::7})" \
-            --notes "Built by Nix from $GITHUB_SHA on Blacksmith macOS (see the run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID). Ad hoc signed: install with SideStore or AltStore, or Henge.tipa with TrollStore."
+          title="Nightly (${GITHUB_SHA::7})"
+          notes="Built by Nix from $GITHUB_SHA on Blacksmith macOS (see the run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID). Ad hoc signed: install with SideStore or AltStore, or Henge.tipa with TrollStore."
+          # Updated in place, never deleted first, so a failed publish leaves the last nightly downloadable.
+          if gh release view nightly > /dev/null 2>&1; then
+            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/nightly" -f sha="$GITHUB_SHA" -F force=true > /dev/null
+            gh release upload nightly dist/Henge.ipa dist/Henge.tipa dist/SHA256SUMS --clobber
+            gh release edit nightly --title "$title" --notes "$notes"
+          else
+            gh release create nightly dist/Henge.ipa dist/Henge.tipa dist/SHA256SUMS \
+              --target "$GITHUB_SHA" --prerelease --title "$title" --notes "$notes"
+          fi
