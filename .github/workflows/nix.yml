@@ -94,8 +94,10 @@ jobs:
           # What a failed earlier attempt left behind.
           if gh release view "$tag" > /dev/null 2>&1; then gh release delete "$tag" --yes; fi
           # A re-run of an older commit must not take latest from a newer build.
+          # Assigned on its own line so a failed lookup fails the step instead of reading as "not the tip".
+          tip="$(gh api "repos/$GH_REPO/commits/main" -q .sha)"
           latest=false
-          [ "$(gh api "repos/$GH_REPO/commits/main" -q .sha)" = "$GITHUB_SHA" ] && latest=true
+          [ "$tip" = "$GITHUB_SHA" ] && latest=true
           gh release create "$tag" dist/Henge.ipa dist/Henge.tipa dist/SHA256SUMS \
             --target "$GITHUB_SHA" --latest="$latest" --title "Nightly ${day:0:4}-${day:4:2}-${day:6:2} (${GITHUB_SHA::7})" \
             --notes "Built by Nix from $GITHUB_SHA on Blacksmith macOS (see the run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID). Ad hoc signed: install with SideStore or AltStore, or Henge.tipa with TrollStore."
