@@ -85,6 +85,8 @@ jobs:
         # so a failed run never replaces the previous build.
         run: |
           tag="nightly-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+          # A re-run must not collide with the first attempt's release or leftover draft.
+          [ "$GITHUB_RUN_ATTEMPT" = 1 ] || tag="$tag.$GITHUB_RUN_ATTEMPT"
           gh release create "$tag" dist/Henge.ipa dist/Henge.tipa dist/SHA256SUMS \
             --target "$GITHUB_SHA" --latest --title "Nightly $(date -u +%Y-%m-%d) (${GITHUB_SHA::7})" \
             --notes "Built by Nix from $GITHUB_SHA on Blacksmith macOS (see the run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID). Ad hoc signed: install with SideStore or AltStore, or Henge.tipa with TrollStore."
