@@ -9,6 +9,9 @@ enum Sharing {
     }
 
     static let setUpCommand = "curl -s http://10.0.2.4/.henge/install | sh"
+    /// Less background work and drawing in macOS (host/share.c, lighten_script), and back.
+    static let lightenCommand = "curl -s http://10.0.2.4/.henge/lighten | sh"
+    static let unlightenCommand = "curl -s http://10.0.2.4/.henge/unlighten | sh"
 
     /// Before a Mac starts.
     static func prepare() {

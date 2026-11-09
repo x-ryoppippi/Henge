@@ -12,6 +12,7 @@
 #include "dispatch.h"
 #include "henge-ios-jit.h"
 #include "net_slirp.h"
+#include "dns_proxy.h"
 #include "vm.h"
 #include "install.h"
 
@@ -123,6 +124,12 @@ long henge_vm_balloon(long target_mb) {
 
 uint64_t henge_vm_blocks(void) { return state ? hv_vm_machine()->stats.blocks : 0; }
 uint64_t henge_vm_net_frames(int sent) { return sent ? hv_net_tx_frames : hv_net_rx_frames; }
+
+uint64_t henge_vm_dns(int which) {
+    uint64_t n[3];
+    hv_dns_proxy_stats(&n[0], &n[1], &n[2]);
+    return which >= 0 && which < 3 ? n[which] : 0;
+}
 
 int henge_vm_cpus_on(void) {
     int n = 0;

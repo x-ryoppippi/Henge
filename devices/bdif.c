@@ -22,7 +22,6 @@
 
 #define DATA_FLAGS_READ 0x00030001u  /* the data buffer is written by the device: a read from the disk */
 #define DATA_FLAGS_WRITE 0x00010001u /* read by the device: a write to the disk (macOS 27's iBSS writes aux sector 32768) */
-#define MAX_LEN (128u << 20)
 
 /* A request, in guest memory: three (addr, len, flags) commands. */
 typedef struct {
@@ -150,8 +149,10 @@ static uint64_t bdif_read(void *opaque, uint64_t off, unsigned size) {
     case REG_UNK2: return 1;
     case REG_UNK3: return 0;
     case REG_NEXT_DEVICE:
-        if (devid == DEVID_ROOT) return 0x8000000;
-        if (devid == DEVID_AUX) return 0x10000;
+        /* For storage devices this register is the capacity in 512-byte
+           sectors. iBoot validates GPT addresses against this value. */
+        if (devid == DEVID_ROOT) return b->root ? b->root->size / 512 : 0;
+        if (devid == DEVID_AUX) return b->aux ? b->aux->size / 512 : 0;
         return ~0ull;
     default: return ~0ull;
     }
@@ -163,7 +164,9 @@ static void command(HvBdif *b, HvDisk *disk, uint64_t req_pa) {
     if (hv_phys_read(b->m, req_pa, req, sizeof req) != 0) return;
     if (disk && req[0].len == 16) {
         uint32_t sector[4];
-        if (hv_phys_read(b->m, req[0].addr, sector, sizeof sector) == 0 && req[1].len <= MAX_LEN) {
+        if (hv_phys_read(b->m, req[0].addr, sector, sizeof sector) == 0) {
+            /* The transfer uses validated guest RAM directly. Newer iBoot
+               reads boot assets larger than the old 128 MiB allocation cap. */
             void *buf = hv_phys_ptr(b->m, req[1].addr, req[1].len);
             uint64_t at = (uint64_t)sector[2] * 512;
             if (buf && req[1].flags == DATA_FLAGS_READ) {

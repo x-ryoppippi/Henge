@@ -380,6 +380,7 @@ void hv_tlbi_apply(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_
         hv_tlb_flush_user(cpu);
         hv_tlb_stash_drop(cpu, (int)(xt >> 48));
         cpu->m->stats.reset_why[1]++;
+        if (cpu->m->stats_interval) cpu->m->stats.ijc_reset_kind[2]++;
         hv_ijc_drop_asid(cpu, (uint16_t)(xt >> 48));
     } else {
         if (cpu->m->log >= 2)
@@ -392,10 +393,26 @@ void hv_tlbi_apply(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_
            can be seen; such a flush, within 20 us of a TTBR0 change, is left out. */
         /* HV_SWITCH_FLUSH=2: one in 32 is checked first (hv_tlb_check_all, too slow for all of macOS 27's ~800/s) and done
            if any entry kept no longer matches the page tables. */
+        /* HV_SWITCH_FLUSH=3: under emulation the same flush often comes later than 20 us (the phone: 30-100/s at
+           20-200 us, each emptying every TLB and branch cache of the CPU): up to 200 us it is left out too, if it is at
+           a PC already seen within 20 us of a TTBR0 change, i.e. the same instruction in xnu's switch path. */
         static _Thread_local uint32_t nth;
-        if (crm == 7 && hv_knob[HV_K_SWITCHFLUSH] && since_switch < 480 &&
+        int late = 0;
+        if (crm == 7 && hv_knob[HV_K_SWITCHFLUSH] >= 3 && since_switch >= 480 && since_switch < 4800) {
+            for (int i = 0; i < 4; i++)
+                if (__atomic_load_n(&cpu->m->switch_flush_pc[i], __ATOMIC_RELAXED) == pc) late = 1;
+        }
+        if (crm == 7 && hv_knob[HV_K_SWITCHFLUSH] >= 3 && since_switch < 480) {
+            int known = 0;
+            for (int i = 0; i < 4 && !known; i++) {
+                uint64_t have = __atomic_load_n(&cpu->m->switch_flush_pc[i], __ATOMIC_RELAXED), zero = 0;
+                if (have == pc) known = 1;
+                else if (!have && __atomic_compare_exchange_n(&cpu->m->switch_flush_pc[i], &zero, pc, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) known = 1;
+            }
+        }
+        if (crm == 7 && hv_knob[HV_K_SWITCHFLUSH] && (since_switch < 480 || late) &&
             (hv_knob[HV_K_SWITCHFLUSH] < 2 || (nth++ & 31) || !hv_tlb_check_all(cpu))) {
-            if (cpu->m->stats_interval) cpu->m->stats.flush_skipped++;
+            if (cpu->m->stats_interval) cpu->m->stats.flush_skipped++, cpu->m->stats.flush_skipped_late += (uint64_t)late;
             return;
         }
         if (crm == 7 && cpu->m->stats_interval) {

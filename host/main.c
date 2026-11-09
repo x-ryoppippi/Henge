@@ -559,6 +559,14 @@ static void *input_thread(void *unused) {
                 fclose(bf);
             }
         }
+        else if (!strncmp(line, "btn ", 4)) { /* "btn CODE 1|0": any evdev button code on the virtio mouse (testing) */
+            unsigned code = 0;
+            int down = 0;
+            if (sscanf(line + 4, "%i %d", &code, &down) == 2) {
+                hv_virtio_input_send(board.mouse, HV_EV_KEY, (uint16_t)code, down);
+                hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);
+            }
+        }
         else if (!strncmp(line, "press", 5) || !strncmp(line, "release", 7)) {
             hv_virtio_input_send(board.mouse, HV_EV_KEY, HV_BTN_LEFT, line[0] == 'p');
             hv_virtio_input_send(board.mouse, HV_EV_SYN, 0, 0);

@@ -276,6 +276,7 @@ void hv_ijc_drop_asid(HvCpu *cpu, uint16_t asid) {
 }
 
 void hv_ijc_reset(HvCpu *cpu, int kernel) {
+    if (cpu->m && cpu->m->stats_interval) cpu->m->stats.ijc_reset_kind[kernel ? 1 : 0]++;
     ret_new(cpu, kernel);
     if (cpu->pc_state) cpu->pc_state->last_fill[0] = cpu->pc_state->last_fill[1] = 0;
     /* Every entry of the half is dead now (new ids or kernel generation): so are their hints. */
@@ -379,7 +380,7 @@ static int maps_writable(const HvTlbEntry *e, const uint8_t *host_page) {
 
 /* RAM page pg just became code: drop write permission from cpu's entries for it. */
 void hv_tlb_protect_code_page(HvCpu *cpu, HvRam *ram, uint64_t pg) {
-    uint64_t *hint = &ram->whint[pg * HV_MAX_CPUS + cpu->index];
+    uint64_t *hint = &ram->whint[(size_t)cpu->index * ram->npages + pg];
     uint64_t h = __atomic_exchange_n(hint, 0, __ATOMIC_SEQ_CST);
     const uint8_t *host_page = ram->host + (pg << HV_TLB_PAGE_BITS);
     if (cpu->m) if (cpu->m->stats_interval) cpu->m->stats.protect_kind[h & HV_WHINT_MANY ? 2 : h ? 1 : 0]++;
@@ -530,26 +531,28 @@ void hv_ijc_drop_range(HvCpu *cpu, uint64_t va, uint64_t len, int asid) {
             return;
         }
     }
-    if (last - first >= 4096) { /* scanning the whole set costs more than the cold start: drop the address space */
+    /* Page by page, but only in the range's 32 MB chunks that hold cached targets (a big unmapping, a heap or a
+       file, mostly holds none); past 4096 such pages, scanning costs more than the cold start: drop the address space. */
+    uint64_t c0 = va >> 25, c1 = (va + len - 1) >> 25, n = 0;
+    int wide = c1 - c0 >= 255; /* the chunk bits wrap at 8 GB */
+    for (uint64_t c = c0; !wide && c <= c1 && n < 4096; c++)
+        if (cpu->pc_state->cid_chunks[cid][(c & 255) >> 6] >> (c & 63) & 1) {
+            uint64_t a = c << 11 > first ? c << 11 : first, b = ((c + 1) << 11) - 1 < last ? ((c + 1) << 11) - 1 : last;
+            n += b - a + 1;
+        }
+    if (wide || n >= 4096) {
+        if (m->stats_interval) m->stats.ijc_reset_kind[3]++;
         hv_ijc_drop_asid(cpu, (uint16_t)asid);
         return;
     }
-    {
-        for (uint64_t p = first; p <= last; p++)
+    for (uint64_t c = c0; c <= c1; c++) {
+        if (!(cpu->pc_state->cid_chunks[cid][(c & 255) >> 6] >> (c & 63) & 1)) continue;
+        uint64_t a = c << 11 > first ? c << 11 : first, b = ((c + 1) << 11) - 1 < last ? ((c + 1) << 11) - 1 : last;
+        for (uint64_t p = a; p <= b; p++)
             if (ucode_has(cpu->pc_state, cid, p << HV_TLB_PAGE_BITS)) {
                 m->stats.reset_why[2]++;
                 ijc_clear_page(cpu, p << HV_TLB_PAGE_BITS, 0, salt, 1);
             }
-        return;
-    }
-    for (uint32_t i = 0; i < 1u << HV_UCODE_BITS; i++) {
-        uint64_t k = cpu->pc_state->ucode[i];
-        if (!k || (k - 1) >> 40 != cid) continue;
-        uint64_t p = (k - 1) & 0xffffffffffull;
-        if (p >= (first & 0xffffffffffull) && p <= (last & 0xffffffffffull)) {
-            m->stats.reset_why[2]++;
-            ijc_clear_page(cpu, p << HV_TLB_PAGE_BITS, 0, salt, 1);
-        }
     }
 }
 
@@ -567,7 +570,7 @@ static void stash_drop(HvPerCpu *p, int asid);
    this CPU now maps it writable twice, makes the protector scan). The check
    that must follow, after a full fence, is write_guard's last two lines. */
 static void write_hint(HvCpu *cpu, HvRam *ram, uint64_t pg, uint32_t code) {
-    uint64_t *hint = &ram->whint[pg * HV_MAX_CPUS + cpu->index];
+    uint64_t *hint = &ram->whint[(size_t)cpu->index * ram->npages + pg];
     uint64_t mine = code + 1, old = __atomic_load_n(hint, __ATOMIC_RELAXED), now = old;
     const uint8_t *host_page = ram->host + (pg << HV_TLB_PAGE_BITS);
     if (!(old & HV_WHINT_MANY)) {
@@ -655,9 +658,21 @@ static void tlb_fill(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
 
 /* Walks that may fill the TLB are bracketed by the CPU's walk_seq (odd while
    one runs), so another CPU's TLBI can drop entries here itself and know no
-   fill from an old page table raced it (hv_tlbi_drop_remote_va). */
-static void walk_begin(HvCpu *cpu) {
-    if (cpu->pc_state) __atomic_add_fetch(&cpu->pc_state->walk_seq, 1, __ATOMIC_SEQ_CST);
+   fill from an old page table raced it (hv_tlbi_drop_remote_va).
+   Each walk logs the page it may fill first (walk_page), so a TLBI of another page need not count it as a race.
+   HV_WALK_ANY: a process switch, which saves and restores many entries and the stashes. */
+#define HV_WALK_ANY (~0ull)
+#define WALK_LOG 8
+#define WALK_PAGE_BITS 0x00ffffffffffc000ull /* by the low 56 bits, as drops compare tagged addresses */
+
+static void walk_begin(HvCpu *cpu, uint64_t va) {
+    HvPerCpu *p = cpu->pc_state;
+    if (!p) return;
+    uint32_t k = p->walk_seq >> 1; /* only this CPU moves it */
+    /* The entry is walk k - WALK_LOG's too: a reader that sees it rewritten must also see walk_seq at 2k or past it.
+       A release store (walks_elsewhere's acquire fence pairs with it; walk_end's release does not order a later store). */
+    __atomic_store_n(&p->walk_page[k & (WALK_LOG - 1)], va == HV_WALK_ANY ? HV_WALK_ANY : va & WALK_PAGE_BITS, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&p->walk_seq, 1, __ATOMIC_SEQ_CST); /* after the log entry, as its release */
 }
 
 static void walk_end(HvCpu *cpu) {
@@ -682,7 +697,7 @@ uint32_t hv_mmu_access(HvCpu *cpu, uint64_t va, HvAccess acc, int el, uint64_t *
         }
     }
     HvWalk w;
-    walk_begin(cpu);
+    walk_begin(cpu, va);
     hv_mmu_walk(cpu, va, acc, el, &w);
     if (!w.fsc) tlb_fill(cpu, va, el, &w);
     walk_end(cpu);
@@ -691,10 +706,34 @@ uint32_t hv_mmu_access(HvCpu *cpu, uint64_t va, HvAccess acc, int el, uint64_t *
     return 0;
 }
 
+/* HV_WALK_LOG: whether target's walks that ran (or were running) while walk_seq went from s1 to s2 all filled pages
+   outside the npages from va, so none can have refilled one of them from the old page tables. By its log of the last
+   WALK_LOG walks (a process switch counts as every page). Without the knob, only "no walk at all" passes. */
+static int walks_elsewhere(HvCpu *target, uint32_t s1, uint32_t s2, uint64_t va, uint64_t npages) {
+    if (s1 == s2 && !(s1 & 1)) return 1;
+    if (!hv_knob[HV_K_WALKLOG]) return 0;
+    HvPerCpu *p = target->pc_state;
+    uint32_t k1 = s1 >> 1, k2 = (s2 + 1) >> 1; /* walks k1 .. k2 - 1 */
+    if (k2 - k1 > WALK_LOG) return 0;
+    uint64_t lo = va & WALK_PAGE_BITS, span = npages << HV_TLB_PAGE_BITS;
+    for (uint32_t k = k1; k != k2; k++) {
+        uint64_t pg = __atomic_load_n(&p->walk_page[k & (WALK_LOG - 1)], __ATOMIC_RELAXED);
+        if (pg == HV_WALK_ANY || ((pg - lo) & 0x00ffffffffffffffull) < span) return 0;
+    }
+    /* and no later walk wrote over an entry while it was read: walk k1 + WALK_LOG writes k1's entry once walk_seq is
+       2 (k1 + WALK_LOG), before it goes odd */
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    uint32_t s3 = __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST);
+    if ((s3 >> 1) - k1 >= WALK_LOG) return 0;
+    if (target->m->stats_interval) target->m->stats.race_other_page++;
+    return 1;
+}
+
 int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid) {
     HvPerCpu *p = target->pc_state;
     uint32_t s1 = __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST);
-    if (s1 & 1) { if (target->m->stats_interval) target->m->stats.race_kind[0]++; return 0; } /* mid-walk: it may be about to fill from the old table */
+    /* mid-walk: it may be about to fill from the old table, unless the walk is of another page (and not a switch's) */
+    if ((s1 & 1) && !walks_elsewhere(target, s1, s1, va, 1)) { if (target->m->stats_interval) target->m->stats.race_kind[0]++; return 0; }
     uint32_t c1 = __atomic_load_n(&p->ijc_seq, __ATOMIC_SEQ_CST);
     if (c1 & 1) { if (target->m->stats_interval) target->m->stats.race_kind[1]++; return 0; } /* caching a block it may have looked up through the old mapping */
     if (!((va >> 55) & 1)) stash_drop_va(p, va, asid);
@@ -714,7 +753,7 @@ int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid) {
        during it changed ijc_seq. */
     if (!ijc_drop_va(target, va, asid, 1)) return -1; /* only target can do it: no use trying again */
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    int ok = __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST) == s1 && /* no fill in between */
+    int ok = walks_elsewhere(target, s1, __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST), va, 1) && /* no fill of it in between */
              __atomic_load_n(&p->ijc_seq, __ATOMIC_SEQ_CST) == c1;
     if (!ok) {
         if (target->m->stats_interval) target->m->stats.race_kind[2]++;
@@ -732,7 +771,7 @@ static void stash_drop_range(HvPerCpu *p, uint64_t va, uint64_t npages, int asid
 int hv_tlbi_drop_remote_range(HvCpu *target, uint64_t va, uint64_t npages, int asid) {
     HvPerCpu *p = target->pc_state;
     uint32_t s1 = __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST);
-    if (s1 & 1) { if (target->m->stats_interval) target->m->stats.race_kind[0]++; return 0; }
+    if ((s1 & 1) && !walks_elsewhere(target, s1, s1, va, npages)) { if (target->m->stats_interval) target->m->stats.race_kind[0]++; return 0; }
     uint32_t c1 = __atomic_load_n(&p->ijc_seq, __ATOMIC_SEQ_CST);
     if (c1 & 1) { if (target->m->stats_interval) target->m->stats.race_kind[1]++; return 0; }
     if (!((va >> 55) & 1)) stash_drop_range(p, va, npages, asid);
@@ -756,7 +795,8 @@ int hv_tlbi_drop_remote_range(HvCpu *target, uint64_t va, uint64_t npages, int a
     for (uint64_t i = 0; i < npages; i++)
         if (!ijc_drop_va(target, va + (i << HV_TLB_PAGE_BITS), asid, 1)) return -1;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    int ok = __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST) == s1 && __atomic_load_n(&p->ijc_seq, __ATOMIC_SEQ_CST) == c1;
+    int ok = walks_elsewhere(target, s1, __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST), va, npages) &&
+             __atomic_load_n(&p->ijc_seq, __ATOMIC_SEQ_CST) == c1;
     if (!ok) {
         if (target->m->stats_interval) target->m->stats.race_kind[2]++;
     } else if (fetched) {
@@ -784,7 +824,7 @@ const uint32_t *hv_mmu_fetch(HvCpu *cpu, uint64_t va, uint64_t *pa, uint32_t *av
     }
     HvWalk w;
     cpu->m->stats.fetch_walks++;
-    walk_begin(cpu);
+    walk_begin(cpu, va);
     hv_mmu_walk(cpu, va, HV_ACC_EXEC, cpu->el, &w);
     if (!w.fsc) tlb_fill(cpu, va, cpu->el, &w);
     walk_end(cpu);
@@ -823,7 +863,7 @@ int hv_tlb_refill(HvCpu *cpu, uint64_t va, uint32_t flags) {
        page's last HV_TLB_ADJ bytes misses): a refill would come straight back here. */
     if (bytes <= HV_TLB_ADJ + 1 && off + HV_TLB_ADJ > PAGE_MASK) return 1;
     HvWalk w;
-    walk_begin(cpu);
+    walk_begin(cpu, va);
     hv_mmu_walk(cpu, va, write ? HV_ACC_WRITE : HV_ACC_READ, el, &w);
     if (!w.fsc) tlb_fill(cpu, va, el, &w);
     walk_end(cpu);
@@ -897,12 +937,55 @@ static int tlb_maps_block(HvCpu *cpu, const HvBlock *b) {
 /* The dispatcher caching a block it found for va: only while the TLB still
    says va is there, inside ijc_seq, so another CPU's TLBI can drop this CPU's
    cached targets itself (hv_tlbi_drop_remote_va). */
+/* Note on b's physical page the VA page it is cached under (the page's code changing then drops just those targets,
+   hv_invalidate_code), then check b is still current. Both read-modify-writes and the load are sequentially
+   consistent, against the generation bump and the note's exchange there: either the change sees this note, or this
+   sees the new generation and caches nothing. */
+static int ijc_note_page(const HvBlock *b) {
+    HvRam *r = b->ram;
+    if (!r || !r->ijc_va) return 1;
+    uint64_t pg = (b->pa - r->pa) >> HV_TLB_PAGE_BITS, v = (b->va & ~(uint64_t)PAGE_MASK) | 2;
+    uint64_t *slot = &r->ijc_va[pg];
+    uint64_t old = __atomic_load_n(slot, __ATOMIC_RELAXED);
+    /* Noted already (v, or ~0): what this read saw is what the next change's exchange sees first, so that change
+       drops this target too (its request reaches this CPU after the fill). Else noted here, in the order. */
+    while (old != v && old != ~0ull)
+        if (__atomic_compare_exchange_n(slot, &old, old ? ~0ull : v, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) break;
+    return __atomic_load_n(&r->page_gen[pg], __ATOMIC_SEQ_CST) == b->gen;
+}
+
+void hv_ijc_drop_code_page(HvCpu *cpu, uint64_t v) {
+    ret_new(cpu, 0);
+    ret_new(cpu, 1);
+    if (v == 1 || !cpu->pc_state) return;
+    uint64_t page = v & ~(uint64_t)PAGE_MASK;
+    int kernel = (page >> 55) & 1;
+    if (kernel) {
+        ijc_clear_page(cpu, page, 1, cpu->ijc_salt[1], 1);
+        return;
+    }
+    if (current_asid(cpu) < 0) {
+        ijc_clear_page(cpu, page, 0, cpu->ijc_salt[0], 1);
+        return;
+    }
+    if (cpu->nasid_log > HV_ASID_LOG) { /* the ids given out are not all known: start the user half over */
+        hv_ijc_reset(cpu, 0);
+        return;
+    }
+    /* Every live process id that cached a target in the page (the (id, page) set says which). */
+    for (uint32_t k = 0; k < cpu->nasid_log; k++) {
+        uint32_t cid = cpu->asid_cid[cpu->asid_log[k]];
+        if (cid && ucode_has(cpu->pc_state, cid, page)) ijc_clear_page(cpu, page, 0, (uint64_t)cid << 48, 1);
+    }
+}
+
 int hv_ijc_fill_checked(HvCpu *cpu, HvBlock *b) {
     HvPerCpu *p = cpu->pc_state;
     if (!p) {
         hv_ijc_fill(cpu, b);
         return 1;
     }
+    if (!ijc_note_page(b)) return 0;
     __atomic_add_fetch(&p->ijc_seq, 1, __ATOMIC_SEQ_CST);
     int ok = tlb_maps_block(cpu, b);
     if (ok) hv_ijc_fill(cpu, b);
@@ -930,7 +1013,7 @@ static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
            walk for it here, as hv_tlb_refill does for data. A fault is for the
            dispatcher to take. */
         HvWalk w;
-        walk_begin(cpu);
+        walk_begin(cpu, va);
         hv_mmu_walk(cpu, va, HV_ACC_EXEC, kernel ? 1 : 0, &w);
         if (!w.fsc) tlb_fill(cpu, va, kernel ? 1 : 0, &w);
         walk_end(cpu);
@@ -1059,6 +1142,9 @@ int hv_tlb_check_all(HvCpu *cpu) {
     int bad = 0;
     static int told;
     for (int pass = -1; pass < (p ? HV_STASHES : 0); pass++) {
+        /* The stash passes walk with cpu->ttbr0_el1 set to the stash's: inside a walk of any page, so another CPU's
+           TLBI meanwhile (which reads it for the running ASID, ijc_drop_va) counts as raced and is left to this CPU. */
+        if (pass == 0) walk_begin(cpu, HV_WALK_ANY);
         uint32_t n = 3 * HV_TLB_SIZE;
         const HvTlbStash *s = NULL;
         if (pass >= 0) {
@@ -1103,6 +1189,7 @@ int hv_tlb_check_all(HvCpu *cpu) {
         cpu->ttbr0_el1 = ttbr0;
     }
     cpu->ttbr0_el1 = ttbr0;
+    if (p) walk_end(cpu);
     if (m->stats_interval) {
         m->stats.flush_checked++;
         if (bad) m->stats.flush_check_bad++;
@@ -1123,7 +1210,7 @@ void hv_tlb_switch_user(HvCpu *cpu, uint64_t old, uint64_t now) {
         hv_tlb_flush_user(cpu);
         return;
     }
-    walk_begin(cpu);
+    walk_begin(cpu, HV_WALK_ANY);
     m->stats.tlb_flushes++;
     uint32_t n = cpu->nuser_fills;
     cpu->nuser_fills = 0;

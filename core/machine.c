@@ -19,7 +19,7 @@ extern void hv_xjump_thunk(void);
 static int init_rest(HvMachine *m);
 
 int hv_knob[HV_K_COUNT];
-static const char *const hv_knob_names[HV_K_COUNT] = {"HV_NO_RAS", "HV_SUPERBLOCKS", "HV_GROUPS", "HV_WFI_SPIN", "HV_FLUSH", "HV_K1", "HV_K2", "HV_K3", "HV_TLBT", "HV_JIT_CAP", "HV_RECHECK", "HV_SYNC_WAIT", "HV_SWITCH_FLUSH", "HV_RANGE_DROP"};
+static const char *const hv_knob_names[HV_K_COUNT] = {"HV_NO_RAS", "HV_SUPERBLOCKS", "HV_GROUPS", "HV_WFI_SPIN", "HV_FLUSH", "HV_K1", "HV_K2", "HV_K3", "HV_TLBT", "HV_JIT_CAP", "HV_RECHECK", "HV_SYNC_WAIT", "HV_SWITCH_FLUSH", "HV_RANGE_DROP", "HV_MOVIMM", "HV_PREDSTAT", "HV_WALK_LOG", "HV_HOIST_CHECK", "HV_IJC_PAGES", "HV_DNS_PROXY"};
 
 static void knobs_init(void) {
     for (int i = 0; i < HV_K_COUNT; i++)
@@ -28,6 +28,8 @@ static void knobs_init(void) {
     /* On unless asked: Golden Gate on the phone (2026-11-08) ran 200 process spawns ~3% faster with it, and none
        of the checked skips (1 in 32 are checked, see sysreg.c) found an out-of-date entry. */
     if (!getenv("HV_SWITCH_FLUSH")) hv_knob[HV_K_SWITCHFLUSH] = 2;
+    if (!getenv("HV_IJC_PAGES")) hv_knob[HV_K_IJCPAGES] = 1;
+    if (!getenv("HV_DNS_PROXY")) hv_knob[HV_K_DNSPROXY] = 1;
 }
 
 int hv_knob_set(HvMachine *m, const char *name, int value) {
@@ -58,6 +60,25 @@ static int init_rest(HvMachine *m) {
     /* The TLB layout (cpu.h): HV_TLBT from the environment here too, so the Mac tool and the tests can pick it. */
     hv_knob[HV_K_TLBT] = getenv("HV_TLBT") ? atoi(getenv("HV_TLBT")) : 1; /* table-major unless asked: 9-20% faster in 5 of 6 paired rounds of the mix */
     hv_tlb_tmajor = hv_knob[HV_K_TLBT] != 0;
+    /* HV_MOVIMM=1: constants built in registers instead of loaded from the pool (translate.c put_lit). Off: no
+       measured gain (Mac mix 24.1 s either way, 2026-11-08); the tests pass with it on (HV_MOVIMM=1 make test). */
+    hv_knob[HV_K_MOVIMM] = getenv("HV_MOVIMM") ? atoi(getenv("HV_MOVIMM")) : 0;
+    /* On unless asked: the Mac bench (2026-11-08) posted 130-400 raced remote drops/s with it against 710-1370
+       without (most walks a drop met were of other pages), and the phone's login storm waits up to 24% of a CPU. */
+    hv_knob[HV_K_WALKLOG] = getenv("HV_WALK_LOG") ? atoi(getenv("HV_WALK_LOG")) : 1;
+    if (getenv("HV_HOIST_CHECK")) hv_knob[HV_K_HOIST] = atoi(getenv("HV_HOIST_CHECK"));
+    /* On unless asked: a code change used to drop every CPU's whole branch cache (~100/s with JavaScriptCore's JIT
+       on the Mac bench, 300-390K refills/s after); now only the page's targets (Mac 2026-11-09: resets 195 -> 2/s,
+       a JIT check of 200 recompiled functions correct; bench times the same within noise). */
+    hv_knob[HV_K_IJCPAGES] = getenv("HV_IJC_PAGES") ? atoi(getenv("HV_IJC_PAGES")) : 1;
+    hv_knob[HV_K_DNSPROXY] = getenv("HV_DNS_PROXY") ? atoi(getenv("HV_DNS_PROXY")) : 1;
+    /* So the tests can run the translator these ways too (the iOS and --phone paths read them in knobs_init). */
+    if (getenv("HV_SUPERBLOCKS")) hv_knob[HV_K_SUPERBLOCKS] = atoi(getenv("HV_SUPERBLOCKS"));
+    /* The exact check for an access in a page's last 15 bytes, in the access's out-of-line path (code size only):
+       on the phone, Golden Gate's boot and login send 80-240K such accesses a second to the helper without it. It
+       costs ~13% of the code (Mac 2026-11-09: 296-300 against 259-261 bytes a block), and the phone's code cache
+       fills every 40-60 s: worth a phone A/B (HV_RECHECK 0 vs 1 over a login), not a Mac one (~7K such accesses/s). */
+    hv_knob[HV_K_RECHECK] = getenv("HV_RECHECK") ? atoi(getenv("HV_RECHECK")) : 1;
     /* As many blocks as the region holds (a block is at least ~160 bytes of
        code), so the region filling, not this table, is what flushes; two
        chainable exits each at most. Untouched entries cost nothing. */
@@ -142,6 +163,16 @@ uint64_t hv_cpu_post_tlbi(HvCpu *target, uint32_t op1, uint32_t crn, uint32_t cr
     return post_locked_done(target, p);
 }
 
+/* Code changed in a page whose blocks were cached as branch targets at VA page v (| 2), or v = 1: only the return
+   predictions. Too many queued: the whole branch cache instead. */
+uint64_t hv_cpu_post_ijc_page(HvCpu *target, uint64_t v) {
+    HvPerCpu *p = target->pc_state;
+    pthread_mutex_lock(&p->req_mu);
+    if (p->nijc_page < sizeof p->ijc_page / sizeof p->ijc_page[0]) p->ijc_page[p->nijc_page++] = v;
+    else p->req_flags |= HV_REQ_IJC_RESET;
+    return post_locked_done(target, p);
+}
+
 uint64_t hv_cpu_post(HvCpu *target, uint32_t flags) {
     HvPerCpu *p = target->pc_state;
     pthread_mutex_lock(&p->req_mu);
@@ -173,12 +204,15 @@ void hv_cpu_process_requests(HvCpu *cpu) {
     uint64_t seq = __atomic_load_n(&p->req_seq, __ATOMIC_ACQUIRE);
     if (seq == __atomic_load_n(&p->ack_seq, __ATOMIC_RELAXED)) return;
     static __thread struct { uint32_t op1, crn, crm, op2; uint64_t xt; } q[64];
+    static __thread uint64_t pages[16];
     pthread_mutex_lock(&p->req_mu);
     seq = p->req_seq;
-    uint32_t flags = p->req_flags, n = p->nreq;
+    uint32_t flags = p->req_flags, n = p->nreq, npages = p->nijc_page;
     memcpy(q, p->req, n * sizeof q[0]);
+    memcpy(pages, p->ijc_page, npages * sizeof pages[0]);
     p->req_flags = 0;
     p->nreq = 0;
+    p->nijc_page = 0;
     pthread_mutex_unlock(&p->req_mu);
     if (flags & HV_REQ_TLB_ALL) {
         cpu->m->stats.flush_why[7]++;
@@ -189,6 +223,8 @@ void hv_cpu_process_requests(HvCpu *cpu) {
     if (flags & HV_REQ_IJC_RESET) {
         hv_ijc_reset(cpu, 0);
         hv_ijc_reset(cpu, 1);
+    } else {
+        for (uint32_t i = 0; i < npages; i++) hv_ijc_drop_code_page(cpu, pages[i]);
     }
     __atomic_store_n(&p->ack_seq, seq, __ATOMIC_RELEASE);
     ack_wake(p);
@@ -324,8 +360,10 @@ int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int
     r->code_pages = calloc((size_t)1 << r->pages_log2, 1);
     if (!m->main_ram || size > m->main_ram->size) m->main_ram = r;
     r->page_gen = calloc(pages, sizeof *r->page_gen);
+    r->npages = pages;
     r->whint = calloc(pages * HV_MAX_CPUS, sizeof *r->whint);
-    return r->code_pages && r->page_gen && r->whint ? 0 : -1;
+    r->ijc_va = calloc(pages, sizeof *r->ijc_va);
+    return r->code_pages && r->page_gen && r->whint && r->ijc_va ? 0 : -1;
 }
 
 int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
@@ -388,9 +426,15 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
         m->xchained[k] = m->xchained[--m->nxchained];
     }
     pthread_mutex_unlock(&m->tr_mu);
-    /* The indirect-branch cache may lead into the stale blocks: start it over,
-       here at once and on the other CPUs before they next leave a block (their
-       cache lookups and chained exits check exit_req first). */
+    /* The indirect-branch cache may lead into the stale blocks: drop those entries (or, without HV_IJC_PAGES, the
+       whole cache), here at once and on the other CPUs before they next leave a block (their cache lookups and
+       chained exits check exit_req first). Which entries: the page's blocks were cached under one VA page (ijc_va,
+       read after the generation went up; a fill notes its page before checking the generation, see
+       hv_ijc_fill_checked), so only that page's; under none, only the return predictions go; under several, all. */
+    uint64_t v = __atomic_exchange_n(&r->ijc_va[pg], 0, __ATOMIC_SEQ_CST);
+    if (!hv_knob[HV_K_IJCPAGES]) v = ~0ull;
+    if (m->stats_interval) m->stats.code_ijc[!v ? 0 : v == ~0ull ? 2 : 1]++;
+    if (!v) v = 1;
     for (int i = 0; i < m->ncpus; i++) {
         HvCpu *c = m->cpus[i];
         if (!c) continue;
@@ -398,10 +442,16 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
            or no CPU running yet) it is a request, or a running CPU could read a
            half-written entry and jump into the wrong code. */
         if (c == hv_self) {
-            hv_ijc_reset(c, 0);
-            hv_ijc_reset(c, 1);
-        } else {
+            if (v == ~0ull) {
+                hv_ijc_reset(c, 0);
+                hv_ijc_reset(c, 1);
+            } else {
+                hv_ijc_drop_code_page(c, v);
+            }
+        } else if (v == ~0ull) {
             hv_cpu_post(c, HV_REQ_IJC_RESET);
+        } else {
+            hv_cpu_post_ijc_page(c, v);
         }
     }
     m->stats.reset_why[4]++;

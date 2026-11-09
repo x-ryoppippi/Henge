@@ -618,6 +618,33 @@ static int do_vector(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint64_
     return 0;
 }
 
+/* HV_PREDSTAT (measuring, with every access sent here): how often an access is on the same page as the last one
+   through the same base register, or the last one by the same instruction, or the access just before. The page is
+   keyed with the address space for user addresses (a process switch is a miss, as it would be for a prediction). */
+static void pred_stat(HvCpu *cpu, const HvMemOp *op, uint64_t va, uint64_t pc, int el) {
+    static __thread uint64_t last_reg[2][32], last_site[1 << 16], last_any;
+    static __thread uint64_t n, reg_hit, site_hit, either, any_hit, sp_n, sp_hit, k_n, k_reg, k_site;
+    int kernel = va >> 63;
+    uint64_t key = va >> 14;
+    if (!kernel) key ^= (cpu->ttbr0_el1 & ~1ull) << 20; /* user pages of different address spaces differ */
+    int r = op->mode == HV_ADDR_LITERAL ? 31 : op->rn; /* 31 here is SP (or the literal's PC) */
+    uint32_t s = (uint32_t)((pc >> 2) * 2654435761u) >> 16;
+    int rh = last_reg[el ? 1 : 0][r] == key, sh = last_site[s] == key;
+    n++, reg_hit += rh, site_hit += sh, either += rh || sh, any_hit += last_any == key;
+    if (r == 31 && op->mode != HV_ADDR_LITERAL) sp_n++, sp_hit += rh;
+    if (kernel) k_n++, k_reg += rh, k_site += sh;
+    last_reg[el ? 1 : 0][r] = key, last_site[s] = key, last_any = key;
+    if ((n & ((1u << 24) - 1)) == 0) {
+        fprintf(stderr, "predstat cpu %u: %lluM accesses: same page as the base register's last %.1f%%, as the instruction's last %.1f%%, "
+                        "either %.1f%%, as the access before %.1f%%; SP-based %.1f%% of accesses (register hit %.1f%%); kernel %.1f%% "
+                        "(register %.1f%%, instruction %.1f%%)\n",
+                cpu->index, (unsigned long long)(n >> 20), 100.0 * reg_hit / n, 100.0 * site_hit / n, 100.0 * either / n,
+                100.0 * any_hit / n, 100.0 * sp_n / n, sp_n ? 100.0 * sp_hit / sp_n : 0, 100.0 * k_n / n,
+                k_n ? 100.0 * k_reg / k_n : 0, k_n ? 100.0 * k_site / k_n : 0);
+        n = reg_hit = site_hit = either = any_hit = sp_n = sp_hit = k_n = k_reg = k_site = 0;
+    }
+}
+
 int hv_mem_emulate(HvCpu *cpu, uint32_t insn, uint64_t pc) {
     cpu->m->access_pc = pc;
     HvMemOp op;
@@ -647,6 +674,7 @@ int hv_mem_emulate(HvCpu *cpu, uint32_t insn, uint64_t pc) {
     default:
         break;
     }
+    if (hv_knob[HV_K_PREDSTAT]) pred_stat(cpu, &op, va, pc, el);
 
     int rc = 0;
     switch (op.kind) {

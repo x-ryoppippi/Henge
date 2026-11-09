@@ -178,7 +178,9 @@ final class HardwareMouse {
             self.mice.removeAll { $0 === mouse }
         })
         observers.append(NotificationCenter.default.addObserver(forName: UIPointerLockState.didChangeNotification, object: nil, queue: .main) { note in
-            let locked = (note.object as? UIScene)?.pointerLockState?.isLocked ?? false
+            // The scene comes in the user info: the notification's object isn't it.
+            let scene = note.userInfo?[UIPointerLockState.sceneUserInfoKey] as? UIScene
+            let locked = scene?.pointerLockState?.isLocked ?? false
             HengeLog.log("input", "pointer lock: \(locked ? "on" : "off")")
         })
         PointerLock.set(true)

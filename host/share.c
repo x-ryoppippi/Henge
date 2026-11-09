@@ -602,6 +602,57 @@ static const char install_script[] =
     "launchctl bootstrap \"gui/$(id -u)\" \"$P\"\n"
     "echo 'Henge is set up. You can close this window.'\n";
 
+/* What "curl -s http://10.0.2.4/.henge/lighten | sh" runs in macOS: less background work and drawing, for a Mac
+   whose CPUs are emulated: less animation and drawing, and the system part (update checks, Time Machine) with the
+   Mac's password once. Apple's own background agents can't be turned off with System Integrity Protection on
+   (launchctl disable of gui/ agents did not survive a log out on the Mac bench, 2026-11-08), so it doesn't try.
+   Reduce Motion and Reduce Transparency need System Settings (a script can't write com.apple.universalaccess).
+   Nothing reads the script's own stdin (sh is reading the script from it). */
+static const char lighten_script[] =
+    "#!/bin/sh\n"
+    "echo 'Making macOS lighter for Henge...'\n"
+    "defaults write com.apple.universalaccess reduceMotion -bool true 2>/dev/null </dev/null || "
+    "echo '  Reduce Motion: turn it on in System Settings, Accessibility, Motion.'\n"
+    "defaults write com.apple.universalaccess reduceTransparency -bool true 2>/dev/null </dev/null || "
+    "echo '  Reduce Transparency: turn it on in System Settings, Accessibility, Display.'\n"
+    "defaults write -g NSAutomaticWindowAnimationsEnabled -bool false </dev/null\n"
+    "defaults write -g NSWindowResizeTime -float 0.001 </dev/null\n"
+    "defaults write com.apple.dock launchanim -bool false </dev/null\n"
+    "defaults -currentHost write com.apple.screensaver idleTime -int 0 </dev/null\n"
+    "defaults write com.apple.WindowManager StandardHideWidgets -int 1 </dev/null\n"
+    "defaults write com.apple.WindowManager StageManagerHideWidgets -int 1 </dev/null\n"
+    "W=\"/System/Library/Desktop Pictures/Solid Colors/Black.png\"\n"
+    "[ -f \"$W\" ] || W=$(ls \"/System/Library/Desktop Pictures/Solid Colors/\"*.png 2>/dev/null | head -1)\n"
+    "if [ -n \"$W\" ]; then\n"
+    "  osascript -l JavaScript - \"$W\" >/dev/null 2>&1 <<'JS'\n"
+    "ObjC.import('AppKit');\n"
+    "function run(argv) {\n"
+    "  var url = $.NSURL.fileURLWithPath(argv[0]), screens = $.NSScreen.screens;\n"
+    "  for (var i = 0; i < screens.count; i++)\n"
+    "    $.NSWorkspace.sharedWorkspace.setDesktopImageURLForScreenOptionsError(url, screens.objectAtIndex(i), $({}), null);\n"
+    "}\n"
+    "JS\n"
+    "fi\n"
+    "killall Dock 2>/dev/null\n"
+    "echo 'Done: window and Dock animations, desktop widgets, the screen saver and a moving wallpaper are off.'\n"
+    "echo 'Also turn on Reduce Motion and Reduce Transparency: System Settings, Accessibility.'\n"
+    "echo 'Log out and back in for all of it to take effect. To undo: curl -s http://" HV_SHARE_ADDR "/.henge/unlighten | sh'\n";
+
+/* And back. The wallpaper stays as it is: pick one in System Settings. */
+static const char unlighten_script[] =
+    "#!/bin/sh\n"
+    "defaults write com.apple.universalaccess reduceMotion -bool false 2>/dev/null </dev/null\n"
+    "defaults write com.apple.universalaccess reduceTransparency -bool false 2>/dev/null </dev/null\n"
+    "defaults delete -g NSAutomaticWindowAnimationsEnabled 2>/dev/null </dev/null\n"
+    "defaults delete -g NSWindowResizeTime 2>/dev/null </dev/null\n"
+    "defaults delete com.apple.dock launchanim 2>/dev/null </dev/null\n"
+    "defaults -currentHost delete com.apple.screensaver idleTime 2>/dev/null </dev/null\n"
+    "defaults write com.apple.WindowManager StandardHideWidgets -int 0 </dev/null\n"
+    "defaults write com.apple.WindowManager StageManagerHideWidgets -int 0 </dev/null\n"
+    "killall Dock 2>/dev/null\n"
+    "echo 'Back as it was, apart from the wallpaper (System Settings, Wallpaper).'\n"
+    "echo 'Log out and back in (or restart) for all of it to take effect.'\n";
+
 static int serve_agent(Conn *c, Request *r) {
     if (body_discard(c, r) != 0) return -1;
     int fd = agent_path[0] ? open(agent_path, O_RDONLY) : -1;
@@ -661,6 +712,11 @@ static int serve_henge(Conn *c, Request *r) {
     if (!strcmp(what, "install") && !strcmp(r->method, "GET")) {
         if (body_discard(c, r) != 0) return -1;
         return respond(c, r, 200, "OK", "Content-Type: text/plain\r\n", install_script, sizeof install_script - 1);
+    }
+    if ((!strcmp(what, "lighten") || !strcmp(what, "unlighten")) && !strcmp(r->method, "GET")) {
+        if (body_discard(c, r) != 0) return -1;
+        const char *s = what[0] == 'l' ? lighten_script : unlighten_script;
+        return respond(c, r, 200, "OK", "Content-Type: text/plain\r\n", s, strlen(s));
     }
     if (!strcmp(what, "agent") && !strcmp(r->method, "GET")) return serve_agent(c, r);
     if (!strcmp(what, "clipboard") && !strcmp(r->method, "GET")) return clipboard_get(c, r);

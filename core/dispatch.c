@@ -622,8 +622,9 @@ static void print_stats(HvCpu *cpu, int force) {
         fprintf(stderr, "  whole-TLB flushes/s: TLBI all here %.0f, TLBI all shared %.0f, SCTLR %.0f, TTBR1 %.0f, TCR %.0f, MAIR %.0f, range of all %.0f, requests overflowed %.0f\n",
                 RATE(flush_why[0]), RATE(flush_why[1]), RATE(flush_why[2]), RATE(flush_why[3]), RATE(flush_why[4]), RATE(flush_why[5]),
                 RATE(flush_why[6]), RATE(flush_why[7]));
-        fprintf(stderr, "  TLBI all here/s by time since a TTBR0 change: <2us %.0f, <20us %.0f, <200us %.0f, later %.0f; left out %.0f; at",
-                RATE(flush_after_switch[0]), RATE(flush_after_switch[1]), RATE(flush_after_switch[2]), RATE(flush_after_switch[3]), RATE(flush_skipped));
+        fprintf(stderr, "  TLBI all here/s by time since a TTBR0 change: <2us %.0f, <20us %.0f, <200us %.0f, later %.0f; left out %.0f (%.0f of them late); at",
+                RATE(flush_after_switch[0]), RATE(flush_after_switch[1]), RATE(flush_after_switch[2]), RATE(flush_after_switch[3]), RATE(flush_skipped),
+                RATE(flush_skipped_late));
         for (int i = 0; i < 8 && s->flush_pc[i].pc; i++) fprintf(stderr, " %llx x%llu", (unsigned long long)s->flush_pc[i].pc, (unsigned long long)s->flush_pc[i].n);
         fprintf(stderr, "\n");
         if (s->flush_checked)
@@ -664,9 +665,14 @@ static void print_stats(HvCpu *cpu, int force) {
                 RATE(light_fail[0]), RATE(light_fail[1]), RATE(light_fail[2]), RATE(light_fail[3]), RATE(light_walks) / 1e3);
         fprintf(stderr, "  big user-range TLBIs/s: %.0f TLB only in the range, %.0f with no cached targets to drop; big kernel ranges %.0f\n",
                 RATE(tlb_range_flushes), RATE(range_spared), RATE(kernel_ranges));
+        fprintf(stderr, "  whole branch-cache drops/s: user half %.0f, kernel half %.0f, a process's by TLBI ASID %.0f, by a range of 64 MB+ %.0f\n",
+                RATE(ijc_reset_kind[0]), RATE(ijc_reset_kind[1]), RATE(ijc_reset_kind[2]), RATE(ijc_reset_kind[3]));
+        fprintf(stderr, "  code changes/s: no cached target into the page %.0f, that VA page's targets dropped %.0f, all dropped %.0f\n",
+                RATE(code_ijc[0]), RATE(code_ijc[1]), RATE(code_ijc[2]));
         fprintf(stderr, "  TLBIs left to other CPUs/s: raced %.0f, every address space's cached targets %.0f, big range %.0f, ASID or all %.0f\n",
                 RATE(posted_kind[0]), RATE(posted_kind[3]), RATE(posted_kind[1]), RATE(posted_kind[2]));
-        fprintf(stderr, "  remote drop races/s: walking %.0f, filling %.0f, during %.0f\n", RATE(race_kind[0]), RATE(race_kind[1]), RATE(race_kind[2]));
+        fprintf(stderr, "  remote drop races/s: walking %.0f, filling %.0f, during %.0f; walks of other pages let through %.0f\n", RATE(race_kind[0]), RATE(race_kind[1]), RATE(race_kind[2]),
+                RATE(race_other_page));
         {
             static const char *kn[16] = {"copy", "pcrel", "branch", "branch-reg", "eret", "literal", "memory", "prefetch",
                                          "exception", "sysreg", "sys", "barrier", "wait", "pac", "undef", "?"};

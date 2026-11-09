@@ -500,6 +500,24 @@ struct SessionView: View {
                          : "Once for each Mac: open Terminal on the Mac, tap this, then press Return. When macOS asks about henge-agent and local networks, choose Allow. It types \(Sharing.setUpCommand) and needs the Mac's keyboard layout to be U.S.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
+                Section("Lighter macOS") {
+                    Button("Type the Lighter macOS Command") {
+                        showDetails = false
+                        Task {
+                            try? await Task.sleep(nanoseconds: 600_000_000)
+                            await Keys.typeSlowly(Sharing.lightenCommand)
+                        }
+                    }
+                    Button("Type the Undo Command") {
+                        showDetails = false
+                        Task {
+                            try? await Task.sleep(nanoseconds: 600_000_000)
+                            await Keys.typeSlowly(Sharing.unlightenCommand)
+                        }
+                    }
+                    Text("Less drawing for the emulated CPUs: window and Dock animations, desktop widgets, the screen saver and a moving wallpaper go. Open Terminal on the Mac, tap the button and press Return, then log out and back in. Also turn on Reduce Motion and Reduce Transparency in the Mac's System Settings, Accessibility. Undo puts it back, apart from the wallpaper. Needs the Mac's keyboard layout to be U.S.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
                 Section("Log") {
                     VStack(alignment: .leading, spacing: 1) {
                         ForEach(Array(log.suffix(30).enumerated()), id: \.offset) { _, line in
@@ -578,7 +596,8 @@ struct SessionView: View {
             if tick % 10 == 0 {
                 let gpuFrames = henge_vm_gpu_frames()
                 HengeLog.log("perf", "blocks/s \(String(format: "%.0f", blocksPerSecond)), GPU frames/10s \(gpuFrames &- lastGPUFrames), "
-                             + "network tx \(framesOut), rx \(framesIn), thermal \(Self.thermalLabel(heat))")
+                             + "network tx \(framesOut), rx \(framesIn), dns \(henge_vm_dns(0)) answered \(henge_vm_dns(2)) unanswered, "
+                             + "thermal \(Self.thermalLabel(heat))")
                 lastGPUFrames = gpuFrames
             }
             if tick == 60 && !stillWallpaperTipShown { // about when the desktop is up after a login

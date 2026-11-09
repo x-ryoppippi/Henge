@@ -33,7 +33,7 @@ static const TestProgram programs[] = {
 
 static uint8_t *data, *stack, *pt;
 static uint64_t data_seed;
-static uint64_t ttbr0, pt_next;
+static uint64_t ttbr0, ttbr0_el0, pt_next, map_ap;
 
 static void reset_data(void) {
     uint64_t s = data_seed * 0x2545f4914f6cdd1dull + 7;
@@ -64,7 +64,7 @@ static void map_page(uint64_t va, uint64_t pa) {
         table = *e & 0x0000ffffffffc000ull;
     }
     /* page, AttrIndx 0 (normal), AP=00 (EL1 RW), inner shareable, AF */
-    pt_host(table)[(va >> 14) & 0x7ff] = pa | 3 | 3u << 8 | 1u << 10;
+    pt_host(table)[(va >> 14) & 0x7ff] = pa | 3 | 3u << 8 | 1u << 10 | map_ap;
 }
 
 static void map_range(uint64_t va, uint64_t pa, uint64_t size) {
@@ -78,6 +78,17 @@ static void build_page_tables(void) {
     map_range(code, code, mem_programs_finish - mem_programs_begin);
     map_range((uint64_t)(uintptr_t)stack, (uint64_t)(uintptr_t)stack, STACK_SIZE);
     map_range((uint64_t)(uintptr_t)data, DATA_PA, DATA_SIZE);
+    /* The same for EL0: code read-only at both ELs (EL0-writable memory never runs at EL1), data and stack read-write. */
+    ttbr0_el0 = pt_alloc();
+    uint64_t root = ttbr0;
+    ttbr0 = ttbr0_el0;
+    map_ap = 3u << 6;
+    map_range(code, code, mem_programs_finish - mem_programs_begin);
+    map_ap = 1u << 6;
+    map_range((uint64_t)(uintptr_t)stack, (uint64_t)(uintptr_t)stack, STACK_SIZE);
+    map_range((uint64_t)(uintptr_t)data, DATA_PA, DATA_SIZE);
+    map_ap = 0;
+    ttbr0 = root;
 }
 
 static void mmu_on(HvCpu *cpu) {
@@ -85,6 +96,15 @@ static void mmu_on(HvCpu *cpu) {
     cpu->tcr_el1 = 16 | 2u << 14 | 1u << 23 | 5ull << 32;      /* T0SZ 16, TG0 16K, EPD1, IPS 48 bits */
     cpu->ttbr0_el1 = ttbr0;
     cpu->sctlr_el1 |= 1 | 1u << 2 | 1u << 12;                   /* M, C, I */
+    hv_tlb_flush(cpu);
+}
+
+/* The program at EL0: its accesses through the user TLB table (the other modes run at EL1). */
+static void mmu_on_el0(HvCpu *cpu) {
+    mmu_on(cpu);
+    cpu->ttbr0_el1 = ttbr0_el0;
+    cpu->sctlr_el1 |= 1u << 14 | 1u << 15 | 1u << 26;          /* DZE, UCT, UCI: DC ZVA, CTR_EL0, cache ops at EL0 */
+    cpu->el = 0;
     hv_tlb_flush(cpu);
 }
 
@@ -156,11 +176,11 @@ int main(void) {
     build_page_tables();
     m.trace = getenv("HV_TRACE") != NULL;
 
-    static const char *mode_names[] = {"C slow path", "fast path", "fast path, MMU on"};
+    static const char *mode_names[] = {"C slow path", "fast path", "fast path, MMU on", "fast path, EL0"};
     size_t count = sizeof programs / sizeof programs[0];
     int failed = 0;
     static uint8_t native_data[DATA_SIZE];
-    for (int mode = 0; mode < 3; mode++) {
+    for (int mode = 0; mode < 4; mode++) {
         m.slow_mem = mode == 0;
         hv_flush_blocks(&m);
         for (size_t i = 0; i < count; i++) {
@@ -174,7 +194,7 @@ int main(void) {
             memcpy(native_data, data, DATA_SIZE);
             reset_data();
             m.stat_slow_mem = 0;
-            int bad = run_jit(&m, p, &init, &jit, mode == 2 ? mmu_on : NULL);
+            int bad = run_jit(&m, p, &init, &jit, mode == 2 ? mmu_on : mode == 3 ? mmu_on_el0 : NULL);
             if (!bad) bad = compare_cpus(p->name, &native, &jit);
             for (size_t off = 0; off < DATA_SIZE && !bad; off += 8)
                 if (memcmp(native_data + off, data + off, 8) != 0) {
@@ -193,7 +213,7 @@ int main(void) {
     hv_machine_add_mmio(&m, 0x20000000, 0x1000, NULL, dev_read, dev_write, "test device");
     m.slow_mem = 0;
     failed += test_mmio(&m);
-    printf("%zu programs x 3 modes + mmio, %d failures, %llu chained exits\n", count, failed,
+    printf("%zu programs x 4 modes + mmio, %d failures, %llu chained exits\n", count, failed,
            (unsigned long long)m.stats.chained);
     return failed != 0;
 }

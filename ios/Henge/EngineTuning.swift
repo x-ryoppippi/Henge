@@ -21,7 +21,7 @@ enum EngineTuning {
     static func apply() {
         var env = defaults
         let d = UserDefaults.standard
-        if d.integer(forKey: refreshKey) == 120 { env["HV_HZ"] = "120" }
+        if [30, 120].contains(d.integer(forKey: refreshKey)) { env["HV_HZ"] = String(d.integer(forKey: refreshKey)) }
         if d.bool(forKey: superblocksKey) { env["HV_SUPERBLOCKS"] = "1" } else { unsetenv("HV_SUPERBLOCKS") }
         if d.bool(forKey: wfiSpinKey) { env["HV_WFI_SPIN"] = "50" }
         if d.object(forKey: fastFlushKey) as? Bool == false { env["HV_FLUSH"] = "0" }

@@ -1,6 +1,7 @@
 /* The guest's network: user-mode NAT through libslirp (as QEMU's -netdev user),
    so it needs no root and no entitlement. 10.0.2.0/24: the host is 10.0.2.2,
-   DNS 10.0.2.3, the guest gets 10.0.2.15 by DHCP.
+   DNS 10.0.2.3, the guest gets 10.0.2.15 by DHCP. DNS over UDP is answered through the
+   host's own resolver (dns_proxy.c), not libslirp's choice of name server.
 
    libslirp is not thread-safe, so it lives on one thread with its sockets and
    timers. Frames the guest sends are queued to it (and the thread woken through
@@ -8,6 +9,7 @@
    virtio-net device on the CPU thread (hv_net_poll), which may only take them
    when the guest has posted receive buffers. */
 #include "net_slirp.h"
+#include "dns_proxy.h"
 #include "share.h"
 
 #include <arpa/inet.h>
@@ -233,11 +235,23 @@ static void *net_thread(void *unused) {
     return NULL;
 }
 
+/* A DNS lookup's thread (dns_proxy.c): its answer for the guest, or the query back for libslirp. */
+static void dns_send(const uint8_t *frame, uint32_t len, int guest) {
+    if (guest) {
+        log_frame("rx dns", frame, len);
+        if (push(&to_guest, frame, len)) hv_machine_wake(machine);
+    } else if (push(&to_host, frame, len)) {
+        char c = 0;
+        (void)!write(wake_pipe[1], &c, 1);
+    }
+}
+
 /* CPU thread: the guest sent a frame. */
 static void transmit(void *opaque, const uint8_t *frame, uint32_t len) {
     (void)opaque;
     hv_net_tx_frames++;
     log_frame("tx", frame, len);
+    if (hv_dns_proxy_take(frame, len, dns_send)) return;
     if (push(&to_host, frame, len)) {
         char c = 0;
         (void)!write(wake_pipe[1], &c, 1);

@@ -1,4 +1,5 @@
 #include <fcntl.h>
+#include <errno.h>
 #include "../core/machine.h"
 #include "disk.h"
 
@@ -6,6 +7,8 @@
 #include <sys/stat.h>
 #include <stdlib.h>
 #include <unistd.h>
+
+#define DISK_IO_CHUNK (128u << 20)
 
 int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly) {
     d->wfd = -1;
@@ -44,7 +47,9 @@ int hv_disk_read(HvDisk *d, uint64_t off, void *buf, uint64_t len) {
     if (off > d->size || len > d->size - off) return -1;
     uint8_t *p = buf;
     while (len) {
-        ssize_t n = pread(d->fd, p, len, (off_t)(d->offset + off));
+        size_t count = len > DISK_IO_CHUNK ? DISK_IO_CHUNK : (size_t)len;
+        ssize_t n = pread(d->fd, p, count, (off_t)(d->offset + off));
+        if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return -1;
         p += n;
         off += (uint64_t)n;
@@ -57,7 +62,9 @@ int hv_disk_write(HvDisk *d, uint64_t off, const void *buf, uint64_t len) {
     if (d->readonly || off > d->size || len > d->size - off) return -1;
     const uint8_t *p = buf;
     while (len) {
-        ssize_t n = pwrite(d->wfd >= 0 ? d->wfd : d->fd, p, len, (off_t)(d->offset + off));
+        size_t count = len > DISK_IO_CHUNK ? DISK_IO_CHUNK : (size_t)len;
+        ssize_t n = pwrite(d->wfd >= 0 ? d->wfd : d->fd, p, count, (off_t)(d->offset + off));
+        if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return -1;
         p += n;
         off += (uint64_t)n;

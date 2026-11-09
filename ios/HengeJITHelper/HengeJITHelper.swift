@@ -17,8 +17,16 @@ private enum HengeJITWork {
             .appendingPathComponent("StikJIT", isDirectory: true)
         let paths = DDIPaths.default(in: root)
         var configuration = StikJIT.Configuration.default
+        /// Appended to the reply so Henge's log shows how the port was chosen.
+        var portNote = ""
         if let rsdPort = request.rsdPort {
             configuration.rsdPort = rsdPort
+        } else if request.operation != .resetDDI {
+            // Henge found no advertised port. StikJIT's 49152 is closed when the device picked another at boot.
+            let lookup = RSDPortResolver.resolve()
+            NSLog("[HengeJIT] RemotePairing port: %@", lookup.detail)
+            if let port = lookup.port { configuration.rsdPort = port }
+            portNote = " [helper port lookup: \(lookup.detail); using \(configuration.rsdPort)]"
         }
 
         do {
@@ -45,10 +53,10 @@ private enum HengeJITWork {
                 switch readiness {
                 case .ready(let security):
                     return .init(success: true,
-                                 message: "LocalDevVPN is reachable and the Developer Disk Image is ready.",
+                                 message: "LocalDevVPN is reachable and the Developer Disk Image is ready." + portNote,
                                  txmPresent: security.isTXMPresent)
                 case .unreachable(let reason), .preparationFailed(let reason):
-                    return .init(success: false, message: reason, txmPresent: StikJIT.isTXMPresent)
+                    return .init(success: false, message: reason + portNote, txmPresent: StikJIT.isTXMPresent)
                 @unknown default:
                     return .init(success: false, message: "StikJIT returned an unknown preparation state.",
                                  txmPresent: StikJIT.isTXMPresent)
@@ -69,13 +77,13 @@ private enum HengeJITWork {
                     forceScript: true,
                     preparationProgress: { NSLog("[HengeJIT] prepare: %@", String(describing: $0)) },
                     progress: { NSLog("[HengeJIT] %@", $0) })
-                return .init(success: true, message: "Henge detached cleanly from its built-in JIT helper.",
+                return .init(success: true, message: "Henge detached cleanly from its built-in JIT helper." + portNote,
                              txmPresent: StikJIT.isTXMPresent)
             case .resetDDI:
                 preconditionFailure("Handled above")
             }
         } catch {
-            return .init(success: false, message: error.localizedDescription,
+            return .init(success: false, message: error.localizedDescription + portNote,
                          txmPresent: StikJIT.isTXMPresent)
         }
     }

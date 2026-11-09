@@ -19,7 +19,7 @@ static const char *work_dir(void) {
     w = getenv("TMPDIR");
     return w && *w ? w : "/tmp";
 }
-#define RAM_SIZE (64ull << 20)
+#define RAM_SIZE (384ull << 20)
 
 static HvMachine m;
 static HvCpu cpu;
@@ -184,7 +184,12 @@ static void test_bdif(HvDisk *root, HvDisk *aux) {
     a = ret; l = 1; f = 0; memcpy(r + 32, &a, 8); memcpy(r + 40, &l, 4); memcpy(r + 44, &f, 4);
     memcpy(ram(req), r, 48);
     check("bdif status", rd32(VMAPPLE_BDOOR), 1);
-    check("bdif root next-device", rd32(VMAPPLE_BDOOR + 0x420), 0x8000000);
+    check("bdif root capacity", rd32(VMAPPLE_BDOOR + 0x420), root->size / 512);
+    check("bdif aux capacity", rd32(VMAPPLE_BDOOR + 0x10000 + 0x420), aux->size / 512);
+    uint64_t original_size = root->size;
+    root->size = 96ull << 30;
+    check("bdif expanded root capacity", rd32(VMAPPLE_BDOOR + 0x420), (96ull << 30) / 512);
+    root->size = original_size;
     for (int which = 0; which < 2; which++) {
         HvDisk *d = which ? aux : root;
         ram(ret)[0] = 0xee;
@@ -194,6 +199,34 @@ static void test_bdif(HvDisk *root, HvDisk *aux) {
         check(which ? "bdif aux read ok" : "bdif root read ok", ram(ret)[0], 0);
         check(which ? "bdif aux data" : "bdif root data", memcmp(ram(data), want, 1024), 0);
     }
+
+    /* The 27.3 upgrade firmware reads this asset in one request. */
+    const uint32_t large_length = 285216768;
+    const uint64_t disk_offset = 4ull << 20;
+    const uint64_t large_data = base + (32ull << 20);
+    const uint8_t marker = 0xa7;
+    check("large boot disk fixture", ftruncate(root->fd, (off_t)(disk_offset + large_length)), 0);
+    root->size = disk_offset + large_length;
+    check("large boot asset first marker", pwrite(root->fd, &marker, 1, (off_t)disk_offset), 1);
+    check("large boot asset last marker", pwrite(root->fd, &marker, 1, (off_t)(root->size - 1)), 1);
+    sector[2] = (uint32_t)(disk_offset / 512);
+    memcpy(ram(sec), sector, sizeof sector);
+    memcpy(r + 16, &large_data, sizeof large_data);
+    memcpy(r + 24, &large_length, sizeof large_length);
+    memcpy(ram(req), r, sizeof r);
+    ram(ret)[0] = 0xee;
+    wr64(VMAPPLE_BDOOR + 0x408, req);
+    check("bdif large boot asset read", ram(ret)[0], 0);
+    check("bdif large read first byte", ram(large_data)[0], marker);
+    check("bdif large read last byte", ram(large_data)[large_length - 1], marker);
+
+    uint64_t invalid_buffer = base + RAM_SIZE - 1024;
+    memcpy(r + 16, &invalid_buffer, sizeof invalid_buffer);
+    memcpy(ram(req), r, sizeof r);
+    wr64(VMAPPLE_BDOOR + 0x408, req);
+    check("bdif rejects large read outside guest RAM", ram(ret)[0], 1);
+    check("restore boot disk fixture", ftruncate(root->fd, (off_t)original_size), 0);
+    root->size = original_size;
 }
 
 /* A small virtio driver, as a guest would do it. */
